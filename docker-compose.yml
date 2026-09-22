@@ -1,0 +1,10 @@
+version: "3.3"
+
+services:
+  ocr:
+    build: .
+    image: ocr-invoice-app:dev
+    container_name: ocr-invoice-app
+    ports:
+      - "8004:8000"
+    restart: unless-stopped

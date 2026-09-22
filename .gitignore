@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+
+# 虚拟环境
+venv/
+paddle-env/
+.env
+
+# 日志和临时文件
+*.log
+*.tmp
+*.bak
+result.json
+
+# 本地样图、训练数据和训练产物
+data/
+training/datasets/
+training/runs/
+models/custom/
+
+# 上传和静态文件
+uploads/
+static/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 测试临时文件
+test_*.py
+*_test.py
+!tests/test_*.py
+
+# 下载失败的空模型文件
+ch_PP-OCRv4_rec_server_infer.onnx
+
+# 系统文件
+.DS_Store
+Thumbs.db

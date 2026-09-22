@@ -1,0 +1,7 @@
+rapidocr==3.9.2
+onnxruntime==1.30.0
+openvino==2026.4.0
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+python-multipart==0.0.32
+pillow==12.3.0

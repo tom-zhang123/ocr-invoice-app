@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+dist/
+tests/
+sample.jpg
+data/
+training/
+models/custom/
+.git/
+.gitignore
+README.md
+docker-compose.yml
+Dockerfile.paddle
