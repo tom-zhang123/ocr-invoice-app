@@ -11,7 +11,8 @@ ENV RAPIDOCR_MODEL_ROOT_DIR=/opt/rapidocr-models \
     PACKAGE_TEXT_OCR_CONCURRENCY=1
 
 COPY requirements-package.txt .
-RUN pip install --no-cache-dir -r requirements-package.txt
+RUN pip install --no-cache-dir --default-timeout=300 --retries=10 \
+        -r requirements-package.txt
 
 COPY package_ocr_models.py .
 RUN python -c "from package_ocr_models import warmup_package_model; warmup_package_model()"
