@@ -1,0 +1,21 @@
+version: "3.3"
+
+services:
+  package-text-ocr:
+    build:
+      context: .
+      dockerfile: Dockerfile.package
+    image: package-text-ocr:dev
+    container_name: package-text-ocr
+    ports:
+      - "127.0.0.1:8005:8000"
+    environment:
+      PACKAGE_TEXT_OCR_TOKEN: ${PACKAGE_TEXT_OCR_TOKEN:?PACKAGE_TEXT_OCR_TOKEN is required}
+      PACKAGE_TEXT_OCR_MAX_IMAGE_BYTES: ${PACKAGE_TEXT_OCR_MAX_IMAGE_BYTES:-1048576}
+      PACKAGE_TEXT_OCR_CONCURRENCY: ${PACKAGE_TEXT_OCR_CONCURRENCY:-1}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped

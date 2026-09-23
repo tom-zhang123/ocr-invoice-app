@@ -1,0 +1,5 @@
+rapidocr==3.9.2
+openvino==2026.4.0
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+python-multipart==0.0.32

@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+ENV RAPIDOCR_MODEL_ROOT_DIR=/opt/rapidocr-models \
+    PACKAGE_TEXT_OCR_MAX_IMAGE_BYTES=1048576 \
+    PACKAGE_TEXT_OCR_CONCURRENCY=1
+
+COPY requirements-package.txt .
+RUN pip install --no-cache-dir -r requirements-package.txt
+
+COPY package_ocr_models.py .
+RUN python -c "from package_ocr_models import warmup_package_model; warmup_package_model()"
+
+COPY package_main.py package_ocr.py package_text_parser.py ./
+
+EXPOSE 8000
+
+CMD ["uvicorn", "package_main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
