@@ -1,12 +1,18 @@
 import unittest
 
+import cv2
 import numpy as np
 
 from enhanced_ocr import (
     COLUMN_BOUNDS,
     FIELD_ORDER,
     WITHOUT_BATCH_BOUNDS,
+    apply_identifier_alternative,
+    apply_recognition_candidates,
+    field_value_is_valid,
     fit_regular_row_centers,
+    normalize_field,
+    prepare_identifier_cell,
     prepare_page_for_ocr,
     refine_column_layout,
     row_centers_to_lines,
@@ -92,6 +98,189 @@ class RowFittingTest(unittest.TestCase):
 
 
 class CandidateSelectionTest(unittest.TestCase):
+    def test_identifier_alternative_needs_a_valid_high_confidence_pallet(self):
+        row = {"pallet": "A/4", "confidence": {"pallet": 0.92}}
+
+        self.assertFalse(apply_identifier_alternative(row, "pallet", "5/7", 0.67))
+        self.assertTrue(apply_identifier_alternative(row, "pallet", "4/4", 0.96))
+        self.assertEqual("4/4", row["pallet"])
+        self.assertEqual("A/4", row["raw_pallet"])
+        self.assertEqual("identifier_second_opinion", row["corrections"]["pallet"])
+        self.assertFalse(apply_identifier_alternative(row, "pallet", "5/5", 0.99))
+
+    def test_low_confidence_box_needs_independent_quantity_support(self):
+        row = {
+            "box": "4",
+            "qty": "7",
+            "confidence": {"box": 0.73, "qty": 0.99},
+            "validation_errors": {},
+        }
+
+        self.assertFalse(apply_identifier_alternative(row, "box", "9", 0.90))
+        self.assertFalse(apply_identifier_alternative(row, "box", "7", 0.39))
+        self.assertTrue(apply_identifier_alternative(row, "box", "7", 0.46))
+        self.assertEqual("7", row["box"])
+        self.assertEqual("4", row["raw_box"])
+        self.assertEqual("7", row["qty"])
+        self.assertLess(row["confidence"]["box"], 0.85)
+        self.assertNotIn("box", row.get("review_reasons", {}))
+
+    def test_reliable_box_and_uncertain_quantity_are_not_used_for_correction(self):
+        reliable_box = {"box": "4", "qty": "7", "confidence": {"box": 0.95, "qty": 0.99}}
+        uncertain_qty = {
+            "box": "4",
+            "qty": "7",
+            "confidence": {"box": 0.73, "qty": 0.99},
+            "review_reasons": {"qty": "model_disagreement"},
+        }
+
+        self.assertFalse(apply_identifier_alternative(reliable_box, "box", "7", 0.90))
+        self.assertFalse(apply_identifier_alternative(uncertain_qty, "box", "7", 0.90))
+
+    def test_box_suggestion_from_disputed_qty_requires_matching_document_total(self):
+        row = {
+            "box": "4",
+            "qty": "7",
+            "confidence": {"box": 0.73, "qty": 0.99},
+            "review_reasons": {"qty": "model_disagreement"},
+            "validation_errors": {"qty": "ambiguous"},
+        }
+
+        self.assertFalse(apply_identifier_alternative(row, "box", "7", 0.46))
+        self.assertTrue(apply_identifier_alternative(row, "box", "7", 0.46, True))
+        self.assertEqual("7", row["box"])
+        self.assertNotIn("box", row["review_reasons"])
+
+    def test_pallet_normalizes_fragment_spacing_and_fullwidth_slash(self):
+        self.assertEqual("1/10", normalize_field("pallet", "1 ／ 10"))
+        self.assertEqual("1/10", normalize_field("pallet", "1/ 10"))
+
+    def test_pallet_and_box_keep_disagreements_for_review(self):
+        rec = {field: [] for field in FIELD_ORDER}
+        conf = {field: None for field in FIELD_ORDER}
+        rec["pallet"] = [{"text": "1/8", "score": 0.70, "x1": 100, "yc": 180}]
+        rec["box"] = [{"text": "51", "score": 0.70, "x1": 180, "yc": 180}]
+        conf.update({"pallet": 0.70, "box": 0.70})
+        table_rows = [{"yc": 180, "rec": rec, "conf": conf}]
+        centers = {"pallet": [180], "box": [180]}
+
+        apply_recognition_candidates(
+            table_rows,
+            {
+                (0, "pallet"): [{"source": "cell", "text": "1/9", "score": 0.90, "x1": 0}],
+                (0, "box"): [{"source": "cell", "text": "5", "score": 0.90, "x1": 0}],
+            },
+            centers,
+            COLUMN_BOUNDS,
+        )
+        self.assertEqual("1/8", table_rows[0]["rec"]["pallet"][0]["text"])
+        self.assertEqual("51", table_rows[0]["rec"]["box"][0]["text"])
+        self.assertEqual(
+            {"pallet": "model_disagreement", "box": "model_disagreement"},
+            table_rows[0]["review_reasons"],
+        )
+
+        apply_recognition_candidates(
+            table_rows,
+            {
+                (0, "pallet"): [{"source": "column", "text": "1/9", "score": 0.91, "x1": 20}],
+                (0, "box"): [{"source": "column", "text": "5", "score": 0.91, "x1": 20}],
+            },
+            centers,
+            COLUMN_BOUNDS,
+        )
+        self.assertEqual("1/9", table_rows[0]["rec"]["pallet"][0]["text"])
+        self.assertEqual("5", table_rows[0]["rec"]["box"][0]["text"])
+        self.assertEqual(
+            {"pallet": "model_disagreement", "box": "model_disagreement"},
+            table_rows[0]["review_reasons"],
+        )
+        self.assertEqual(
+            ["page", "cell", "column"],
+            [item["source"] for item in table_rows[0]["field_candidates"]["pallet"]],
+        )
+
+    def test_reliable_page_identifiers_are_not_overridden_by_cropped_readings(self):
+        rec = {field: [] for field in FIELD_ORDER}
+        conf = {field: None for field in FIELD_ORDER}
+        rec["pallet"] = [{"text": "2/2", "score": 0.99, "x1": 100, "yc": 180}]
+        rec["box"] = [{"text": "10", "score": 0.99, "x1": 180, "yc": 180}]
+        conf.update({"pallet": 0.99, "box": 0.99})
+        table_rows = [{"yc": 180, "rec": rec, "conf": conf}]
+
+        apply_recognition_candidates(
+            table_rows,
+            {
+                (0, "pallet"): [{"source": "column", "text": "9/2", "score": 0.95, "x1": 20}],
+                (0, "box"): [{"source": "column", "text": "6", "score": 0.97, "x1": 20}],
+            },
+            {"pallet": [180], "box": [180]},
+            COLUMN_BOUNDS,
+        )
+
+        self.assertEqual("2/2", table_rows[0]["rec"]["pallet"][0]["text"])
+        self.assertEqual("10", table_rows[0]["rec"]["box"][0]["text"])
+        self.assertNotIn("review_reasons", table_rows[0])
+
+    def test_invalid_pallet_uses_stronger_cropped_reading_without_claiming_validity(self):
+        rec = {field: [] for field in FIELD_ORDER}
+        conf = {field: None for field in FIELD_ORDER}
+        rec["pallet"] = [{"text": "A14", "score": 0.84, "x1": 100, "yc": 180}]
+        conf["pallet"] = 0.84
+        table_rows = [{"yc": 180, "rec": rec, "conf": conf}]
+
+        apply_recognition_candidates(
+            table_rows,
+            {(0, "pallet"): [{"source": "column", "text": "A4", "score": 0.87, "x1": 20}]},
+            {"pallet": [180]},
+            COLUMN_BOUNDS,
+        )
+
+        self.assertEqual("A4", table_rows[0]["rec"]["pallet"][0]["text"])
+        self.assertFalse(field_value_is_valid("pallet", "A4"))
+
+    def test_valid_box_cell_reading_fills_invalid_page_value(self):
+        rec = {field: [] for field in FIELD_ORDER}
+        conf = {field: None for field in FIELD_ORDER}
+        rec["box"] = [{"text": "?", "score": 0.82, "x1": 180, "yc": 180}]
+        conf["box"] = 0.82
+        table_rows = [{"yc": 180, "rec": rec, "conf": conf}]
+
+        apply_recognition_candidates(
+            table_rows,
+            {(0, "box"): [{"source": "cell", "text": "12", "score": 0.90, "x1": 0}]},
+            {"box": [180]},
+            COLUMN_BOUNDS,
+        )
+
+        self.assertEqual("12", table_rows[0]["rec"]["box"][0]["text"])
+        self.assertNotIn("box", table_rows[0].get("review_reasons", {}))
+
+    def test_missing_page_reading_is_not_counted_twice(self):
+        rec = {field: [] for field in FIELD_ORDER}
+        conf = {field: None for field in FIELD_ORDER}
+        table_rows = [{"yc": 180, "rec": rec, "conf": conf}]
+
+        apply_recognition_candidates(
+            table_rows,
+            {(0, "box"): [{"source": "cell", "text": "8", "score": 0.70, "x1": 0}]},
+            {"box": [180]},
+            COLUMN_BOUNDS,
+        )
+        apply_recognition_candidates(
+            table_rows,
+            {(0, "box"): [{"source": "column", "text": "9", "score": 0.91, "x1": 20}]},
+            {"box": [180]},
+            COLUMN_BOUNDS,
+        )
+
+        self.assertEqual("9", table_rows[0]["rec"]["box"][0]["text"])
+        self.assertEqual("model_disagreement", table_rows[0]["review_reasons"]["box"])
+        self.assertEqual(
+            ["cell", "column"],
+            [item["source"] for item in table_rows[0]["field_candidates"]["box"]],
+        )
+
     def test_box_value_selects_an_existing_quantity_candidate(self):
         selected, _, ambiguous, _ = select_quantity_candidate(
             "54",
@@ -101,6 +290,17 @@ class CandidateSelectionTest(unittest.TestCase):
         )
 
         self.assertEqual("54", selected)
+        self.assertTrue(ambiguous)
+
+    def test_box_does_not_override_a_stronger_quantity_reading(self):
+        selected, _, ambiguous, _ = select_quantity_candidate(
+            "4",
+            0.816,
+            [{"source": "column", "text": "44", "score": 0.899}],
+            box_value="4",
+        )
+
+        self.assertEqual("44", selected)
         self.assertTrue(ambiguous)
 
     def test_valid_cell_date_replaces_invalid_page_date(self):
@@ -163,6 +363,26 @@ class CandidateSelectionTest(unittest.TestCase):
 
 
 class FastPathTest(unittest.TestCase):
+    def test_identifier_cell_tracks_row_rules_without_neighboring_column(self):
+        image = np.full((80, 320, 3), 255, dtype=np.uint8)
+        cv2.line(image, (155, 0), (155, 79), (0, 0, 0), 1)
+        cv2.line(image, (223, 0), (223, 79), (0, 0, 0), 1)
+        image[25:40, 165:175] = 0
+        image[25:40, 229:239] = 0
+
+        prepared = prepare_identifier_cell(image, "box", 10, 60, COLUMN_BOUNDS)
+        source = image[12:58, 158:220]
+        scale = 64 / source.shape[0]
+        expected = cv2.resize(
+            source, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC,
+        )
+        expected = cv2.copyMakeBorder(
+            expected, 8, 8, 10, 10, cv2.BORDER_CONSTANT, value=(255, 255, 255),
+        )
+
+        self.assertTrue(np.array_equal(expected, prepared))
+        self.assertIsNone(prepare_identifier_cell(np.full_like(image, 255), "box", 10, 60, COLUMN_BOUNDS))
+
     def test_keeps_full_page_when_row_geometry_is_unavailable(self):
         image = np.full((280, 1280, 3), 255, dtype=np.uint8)
         image[165:180, 500:520] = 0

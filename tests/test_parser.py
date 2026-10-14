@@ -1,6 +1,7 @@
 import unittest
 
 from parser import (
+    clean_pallet,
     clean_sku,
     extract_header,
     parse_batch_candidates,
@@ -14,6 +15,12 @@ class SkuCleanupTest(unittest.TestCase):
     def test_removes_trailing_non_digit_when_remaining_gtin_is_valid(self):
         self.assertEqual("18934804041534", clean_sku("18934804041534N"))
         self.assertEqual("8934804035178", clean_sku("8934804035178*"))
+
+
+class PalletCleanupTest(unittest.TestCase):
+    def test_pallet_spacing_is_removed_without_inventing_separator(self):
+        self.assertEqual("2/12", clean_pallet(" 2 ／ 12 "))
+        self.assertEqual("212", clean_pallet("2 12"))
 
 
 class DateYearReconciliationTest(unittest.TestCase):

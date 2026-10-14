@@ -5,7 +5,12 @@ import time
 import cv2
 import numpy as np
 
-from ocr_models import recognize_lines, recognize_page, recognize_region
+from ocr_models import (
+    recognize_identifier_lines,
+    recognize_lines,
+    recognize_page,
+    recognize_region,
+)
 from parser import (
     COLUMNS,
     HEADER_Y,
@@ -13,6 +18,7 @@ from parser import (
     TABLE_BOTTOM,
     clean_batch,
     clean_digits,
+    clean_pallet,
     clean_sku,
     clean_text,
     extract_header,
@@ -521,6 +527,40 @@ def prepare_cell(image, field, y1, y2, column_bounds):
     return render_region_black(crop, field)
 
 
+def prepare_identifier_cell(image, field, y1, y2, column_bounds):
+    """Use the local table rules to keep curved rows inside their own columns."""
+    height, width = image.shape[:2]
+    top = max(0, int(y1) + 2)
+    bottom = min(height, int(y2) - 2)
+    if bottom - top < 16:
+        return None
+
+    gray = cv2.cvtColor(image[top + 2:bottom - 2], cv2.COLOR_BGR2GRAY)
+    dark = gray < 145
+    boundaries = []
+    for hint in column_bounds[field]:
+        start = max(0, int(hint) - 35)
+        end = min(width, int(hint) + 36)
+        counts = dark[:, start:end].sum(axis=0)
+        candidates = np.flatnonzero(counts >= dark.shape[0] * 0.72)
+        if not len(candidates):
+            return None
+        boundaries.append(start + int(min(candidates, key=lambda x: abs(start + x - hint))))
+
+    expected_width = column_bounds[field][1] - column_bounds[field][0]
+    actual_width = boundaries[1] - boundaries[0]
+    if not expected_width * 0.65 <= actual_width <= expected_width * 1.4:
+        return None
+    crop = image[top:bottom, boundaries[0] + 3:boundaries[1] - 3]
+    if crop.size == 0:
+        return None
+    scale = max(1.0, 64 / crop.shape[0])
+    crop = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+    return cv2.copyMakeBorder(
+        crop, 8, 8, 10, 10, cv2.BORDER_CONSTANT, value=(255, 255, 255),
+    )
+
+
 def prepare_page_for_ocr(
     image,
     header_y,
@@ -707,6 +747,8 @@ def normalize_field(field, text):
     value = clean_text(text)
     if field == "sku":
         return clean_sku(value)
+    if field == "pallet":
+        return clean_pallet(value)
     if field in ("qty", "box"):
         return clean_digits(value)
     if field in ("exp", "mfg"):
@@ -734,6 +776,54 @@ def field_value_is_valid(field, value):
     if field == "batch":
         return re.fullmatch(r"[A-Za-z0-9]{4,}", value) is not None
     return len(value) >= 2
+
+
+def apply_identifier_alternative(row, field, text, score, document_total_matches=False):
+    candidate = normalize_field(field, text)
+    if not candidate or candidate == row.get(field, ""):
+        return False
+
+    if field == "pallet":
+        if (
+            field_value_is_valid(field, row.get(field, ""))
+            or not field_value_is_valid(field, candidate)
+            or score < 0.80
+        ):
+            return False
+    elif field == "box":
+        qty_confidence = (row.get("confidence") or {}).get("qty") or 0
+        box_confidence = (row.get("confidence") or {}).get("box")
+        qty_review = (row.get("review_reasons") or {}).get("qty")
+        qty_issue = (row.get("validation_errors") or {}).get("qty")
+        supported_disagreement = (
+            qty_review == "model_disagreement"
+            and qty_issue == "ambiguous"
+            and document_total_matches
+            and qty_confidence >= 0.95
+        )
+        if (
+            not field_value_is_valid(field, candidate)
+            or candidate != row.get("qty")
+            or score < 0.40
+            or box_confidence is None
+            or box_confidence >= FALLBACK_MIN_CONFIDENCE[field]
+            or qty_confidence < 0.85
+            or ((qty_review or qty_issue) and not supported_disagreement)
+        ):
+            return False
+    else:
+        return False
+
+    row[f"raw_{field}"] = row.get(field, "")
+    row[field] = candidate
+    row.setdefault("corrections", {})[field] = "identifier_second_opinion"
+    row.setdefault("field_candidates", {}).setdefault(field, []).append({
+        "source": "identifier",
+        "text": candidate,
+        "score": round(float(score), 3),
+    })
+    row.setdefault("confidence", {})[field] = round(float(score), 3)
+    return True
 
 
 def should_use_cell_result(field, current_text, current_score, new_text, new_score):
@@ -802,14 +892,16 @@ def select_quantity_candidate(current_text, current_score, candidates, box_value
             and max(scores) < 0.85
         ):
             return common_suffix, max(scores), True, readings
+    selected_text, selected_readings = max(
+        grouped.items(),
+        key=lambda item: (len(item[1]), max(value["score"] for value in item[1])),
+    )
     if field_value_is_valid("box", box_value) and box_value in grouped:
-        selected_text = box_value
-        selected_readings = grouped[box_value]
-    else:
-        selected_text, selected_readings = max(
-            grouped.items(),
-            key=lambda item: (len(item[1]), max(value["score"] for value in item[1])),
-        )
+        box_readings = grouped[box_value]
+        box_score = max(value["score"] for value in box_readings)
+        best_score = max(value["score"] for value in selected_readings)
+        if len(box_readings) == len(selected_readings) and box_score >= best_score - 0.05 - 1e-9:
+            selected_text, selected_readings = box_value, box_readings
     selected_score = max(value["score"] for value in selected_readings)
     return selected_text, selected_score, len(grouped) > 1, readings
 
@@ -1187,6 +1279,79 @@ def apply_recognition_candidates(
                 table_row.setdefault("review_reasons", {})[field] = "model_disagreement"
             continue
 
+        if field in ("pallet", "box"):
+            prior_readings = table_row.get("field_candidates", {}).get(field, [])
+            page_reading = next(
+                (reading for reading in prior_readings if reading["source"] == "page"),
+                None,
+            )
+            source_readings = [
+                reading for reading in prior_readings
+                if reading["source"] != "page"
+            ]
+            for source in ("cell", "column"):
+                source_fragments = [
+                    candidate for candidate in candidates
+                    if candidate.get("source") == source
+                    and candidate["score"] >= 0.30
+                ]
+                if source == "column":
+                    source_fragments = select_aligned_fragments(
+                        source_fragments, target_y, target_x,
+                    )
+                if source_fragments:
+                    source_readings.append({
+                        "source": source,
+                        "text": " ".join(
+                            value["text"]
+                            for value in sorted(
+                                source_fragments,
+                                key=lambda value: value["x1"],
+                            )
+                        ),
+                        "score": min(value["score"] for value in source_fragments),
+                    })
+            page_text = page_reading["text"] if page_reading else ""
+            page_score = page_reading["score"] if page_reading else None
+            if not prior_readings:
+                page_text, page_score = current_text, current_score
+            if (
+                field_value_is_valid(field, page_text)
+                and page_score is not None
+                and page_score >= FALLBACK_MIN_CONFIDENCE[field]
+            ):
+                continue
+            selected_text, selected_score, ambiguous, readings = select_structured_candidate(
+                field,
+                page_text,
+                page_score,
+                source_readings,
+            )
+            if not field_value_is_valid(field, selected_text):
+                best_reading = max(
+                    (reading for reading in readings if reading["text"] and reading["score"] >= 0.30),
+                    key=lambda reading: reading["score"],
+                    default=None,
+                )
+                if best_reading:
+                    selected_text = best_reading["text"]
+                    selected_score = best_reading["score"]
+            if selected_text:
+                x1, x2 = column_bounds[field]
+                table_row["rec"][field] = [{
+                    "text": selected_text,
+                    "score": selected_score,
+                    "xc": (x1 + x2) / 2,
+                }]
+                table_row["conf"][field] = selected_score
+            if readings:
+                table_row.setdefault("field_candidates", {})[field] = readings
+            if ambiguous:
+                table_row.setdefault("review_reasons", {})[field] = "model_disagreement"
+            else:
+                table_row.get("review_reasons", {}).pop(field, None)
+            continue
+
         if field in ("exp", "mfg"):
             source_readings = []
             for source in ("column", "cell"):
@@ -1486,23 +1651,26 @@ def recognize_enhanced(image_path_or_bytes, batch_candidates=None):
                 "name_column_skipped": name_column_skipped,
                 "sku_fallback": sku_fallback_used,
                 "handwriting_fallback_fields": [],
+                "identifier_corrected_fields": [],
             },
             "timing_ms": timings,
             "notes": notes,
             "models": {
                 "general": "PP-OCRv6-small",
                 "handwriting": "PP-OCRv6-small",
+                "identifier": "PP-OCRv5-mobile-en",
             },
         }
 
     matches = {}
     ink_cells = set()
     structured_cell_jobs = []
+    identifier_cell_jobs = []
     for index, table_row in enumerate(table_rows):
-        for field in ("sku", "qty", "exp", "mfg"):
+        for field in ("sku", "qty", "exp", "mfg", "pallet", "box"):
             if field not in column_bounds:
                 continue
-            if field == "sku":
+            if field in ("pallet", "box", "sku"):
                 current_text, current_score = table_row_field_reading(
                     table_row,
                     field,
@@ -1528,7 +1696,8 @@ def recognize_enhanced(image_path_or_bytes, batch_candidates=None):
             )
             if cell is not None:
                 ink_cells.add((index, field))
-                structured_cell_jobs.append((index, field, cell))
+                jobs = identifier_cell_jobs if field in ("pallet", "box") else structured_cell_jobs
+                jobs.append((index, field, cell))
     stage_started = time.perf_counter()
     structured_cell_results = recognize_lines(
         [job[2] for job in structured_cell_jobs],
@@ -1547,6 +1716,27 @@ def recognize_enhanced(image_path_or_bytes, batch_candidates=None):
             "x1": 0,
             "source": "cell",
         })
+
+    timings["identifier_cells"] = 0
+    if identifier_cell_jobs:
+        stage_started = time.perf_counter()
+        identifier_cell_results = recognize_lines(
+            [job[2] for job in identifier_cell_jobs],
+            language="handwriting",
+        )
+        timings["identifier_cells"] = round(
+            (time.perf_counter() - stage_started) * 1000
+        )
+        for (index, field, _), (text, score) in zip(
+            identifier_cell_jobs,
+            identifier_cell_results,
+        ):
+            matches.setdefault((index, field), []).append({
+                "text": text,
+                "score": float(score),
+                "x1": 0,
+                "source": "cell",
+            })
 
     apply_recognition_candidates(
         table_rows,
@@ -1681,7 +1871,8 @@ def recognize_enhanced(image_path_or_bytes, batch_candidates=None):
     )
 
     result_rows = []
-    for tr in table_rows:
+    result_row_indices = []
+    for table_index, tr in enumerate(table_rows):
         rec = tr["rec"]
         conf = tr["conf"]
         row = {}
@@ -1724,6 +1915,7 @@ def recognize_enhanced(image_path_or_bytes, batch_candidates=None):
             for field in row.get("review_reasons", {}):
                 row["validation_errors"][field] = "ambiguous"
             result_rows.append(row)
+            result_row_indices.append(table_index)
 
     reconciliation_total = (
         document_total_qty
@@ -1731,6 +1923,45 @@ def recognize_enhanced(image_path_or_bytes, batch_candidates=None):
         else None
     )
     result_rows = reconcile_quantities_with_total(result_rows, reconciliation_total)
+    document_total_matches = (
+        reconciliation_total is not None
+        and sum(int(row.get("qty") or 0) for row in result_rows) == reconciliation_total
+    )
+
+    identifier_jobs = []
+    for row, table_index in zip(result_rows, result_row_indices):
+        for field in ("pallet", "box"):
+            if field == "pallet" and field_value_is_valid(field, row.get(field, "")):
+                continue
+            if field == "box":
+                score = (row.get("confidence") or {}).get(field)
+                if score is None or score >= FALLBACK_MIN_CONFIDENCE[field]:
+                    continue
+            if not row.get(field) and (table_index, field) not in ink_cells:
+                continue
+            lines = field_row_lines.get(field)
+            if not lines or table_index + 1 >= len(lines):
+                continue
+            cell = prepare_identifier_cell(
+                img, field, lines[table_index], lines[table_index + 1], column_bounds,
+            )
+            if cell is not None:
+                identifier_jobs.append((row, field, cell))
+
+    timings["identifier_second_opinion"] = 0
+    identifier_corrected_fields = set()
+    if identifier_jobs:
+        stage_started = time.perf_counter()
+        alternatives = recognize_identifier_lines([job[2] for job in identifier_jobs])
+        timings["identifier_second_opinion"] = round(
+            (time.perf_counter() - stage_started) * 1000
+        )
+        for (row, field, _), (text, score) in zip(identifier_jobs, alternatives):
+            if apply_identifier_alternative(
+                row, field, text, score, document_total_matches,
+            ):
+                identifier_corrected_fields.add(field)
+
     for row in result_rows:
         row["validation_errors"] = validate_row(row)
         for field in row.get("review_reasons", {}):
@@ -1747,6 +1978,7 @@ def recognize_enhanced(image_path_or_bytes, batch_candidates=None):
             "name_column_skipped": name_column_skipped,
             "sku_fallback": sku_fallback_used,
             "handwriting_fallback_fields": handwriting_fallback_fields,
+            "identifier_corrected_fields": sorted(identifier_corrected_fields),
         },
         "timing_ms": timings,
         "image": {
@@ -1770,6 +2002,7 @@ def recognize_enhanced(image_path_or_bytes, batch_candidates=None):
         "models": {
             "general": "PP-OCRv6-small",
             "handwriting": "PP-OCRv6-small",
+            "identifier": "PP-OCRv5-mobile-en",
         },
     }
 

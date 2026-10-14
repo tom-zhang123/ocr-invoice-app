@@ -5,16 +5,22 @@ KERRY 入库单 OCR 服务
 启动: uvicorn main:app --host 0.0.0.0 --port 8000
 """
 import asyncio
+from datetime import datetime
+import re
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from starlette.concurrency import run_in_threadpool
 
 from enhanced_ocr import recognize_enhanced
+from export_excel import ExportRequest, build_excel
+from label_counter import count_white_labels
+from label_count_page import LABEL_COUNT_PAGE
 from ocr_models import warmup_models
 from parser import parse_batch_candidates
 
 app = FastAPI(title="KERRY Invoice OCR", version="1.1")
 _ocr_semaphore = asyncio.Semaphore(1)
+_count_semaphore = asyncio.Semaphore(2)
 
 
 @app.on_event("startup")
@@ -48,14 +54,51 @@ async def api_ocr(
     return JSONResponse(data)
 
 
+@app.post("/api/export")
+def api_export(request: ExportRequest):
+    workbook = build_excel(request)
+    po_no = re.sub(r"[^A-Za-z0-9_-]", "", request.po_no)[:32] or "unknown"
+    filename = f"invoice-{po_no}-{datetime.now():%Y%m%d-%H%M%S}.xlsx"
+    return StreamingResponse(
+        workbook,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/count-labels")
+async def api_count_labels(file: UploadFile = File(...)):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="请上传图片文件")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="图片内容为空")
+    if len(raw) > 15 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="图片不能超过 15 MB")
+    try:
+        async with _count_semaphore:
+            result = await run_in_threadpool(count_white_labels, raw)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    return JSONResponse(result)
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
-    return PAGE
+    return HYBRID_PAGE
 
 
 @app.get("/hybrid", response_class=HTMLResponse)
 def hybrid():
     return HYBRID_PAGE
+
+
+@app.get("/label-count", response_class=HTMLResponse)
+def label_count():
+    return LABEL_COUNT_PAGE
 
 
 PAGE = """<!DOCTYPE html>
@@ -226,7 +269,7 @@ HYBRID_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ASN 收货（PP-OCRv6+手动录入）</title>
+<title>入库单识别与核实</title>
 <style>
   body{font-family:-apple-system,"Segoe UI",sans-serif;max-width:1400px;margin:20px auto;padding:0 16px;color:#222;background:#f8fafc}
   h1{font-size:20px;margin:0 0 4px}
@@ -234,7 +277,7 @@ HYBRID_PAGE = """<!DOCTYPE html>
   .card{background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:16px;margin:12px 0}
   button{border:0;border-radius:6px;padding:9px 18px;cursor:pointer;font-size:14px}
   .btn-ocr{background:#2563eb;color:#fff}
-  .btn-confirm{background:#16a34a;color:#fff;font-size:15px;padding:11px 28px}
+  .btn-export{background:#0f766e;color:#fff}
   button:disabled{background:#94a3b8;cursor:not-allowed}
   .table-wrap{overflow:auto;max-height:65vh;margin-top:10px}
   table{border-collapse:collapse;width:100%;min-width:1180px;font-size:12px;table-layout:fixed}
@@ -261,12 +304,13 @@ HYBRID_PAGE = """<!DOCTYPE html>
   .review-check input{width:18px;height:18px;cursor:pointer}
   .toolbar{display:flex;justify-content:space-between;align-items:center;margin-top:12px}
   .total{font-size:14px}
-  .validation-status{font-size:12px;color:#b91c1c;margin-left:auto;margin-right:16px}
+  .export-status{font-size:12px;color:#b91c1c;margin-left:auto;margin-right:12px}
+  .page-head{display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .tool-link{font-size:13px;color:#0f766e;text-decoration:none}
 </style>
 </head>
 <body>
-<h1>ASN 收货（PP-OCRv6 + 手动录入）</h1>
-<div class="sub">PP-OCRv6 small 自动识别，批次/板号/箱号直接在表格里填，核实后一键收货</div>
+<div class="page-head"><h1>入库单识别与核实</h1><a class="tool-link" href="/label-count">面单计数</a></div>
 
 <div class="card">
   <input type="file" id="f" accept="image/*">
@@ -286,11 +330,11 @@ HYBRID_PAGE = """<!DOCTYPE html>
   </div>
 </div>
 
-<div class="card" id="confirmArea" style="display:none">
+<div class="card" id="exportArea" style="display:none">
   <div class="toolbar">
     <div class="total">明细合计: <b id="totalQty">0</b> / <span id="documentTotalLabel">单据合计</span>: <b id="documentTotal">-</b></div>
-    <div class="validation-status" id="validationStatus"></div>
-    <button class="btn-confirm" id="confirmBtn" onclick="confirmReceive()">✓ 确认收货</button>
+    <span class="export-status" id="exportStatus" role="status"></span>
+    <button class="btn-export" id="exportBtn" onclick="exportExcel()">导出 Excel</button>
   </div>
 </div>
 
@@ -438,7 +482,7 @@ async function run(){
     document.getElementById('m_note').value=d.notes||'';
     renderTable();
     document.getElementById('out').style.display='block';
-    document.getElementById('confirmArea').style.display='block';
+    document.getElementById('exportArea').style.display='block';
   }catch(e){st.textContent='出错: '+e.message;}
   finally{btn.disabled=false;}
 }
@@ -497,9 +541,13 @@ function setRowReviewed(index,checked){
 }
 
 function updateTotal(){
-  let total=0;
-  ROWS.forEach(row=>{total+=parseInt(row.qty)||0;});
-  document.getElementById('totalQty').textContent=total;
+  let total=0,allValid=true;
+  ROWS.forEach(row=>{
+    const qty=String(row.qty??'').trim();
+    if(/^[1-9][0-9]*$/.test(qty))total+=Number(qty);
+    else allValid=false;
+  });
+  document.getElementById('totalQty').textContent=allValid?total:'待核实';
   document.getElementById('documentTotal').textContent=DOCUMENT_TOTAL??'-';
   document.getElementById('documentTotalLabel').textContent=TOTAL_PAGES>1?'整单合计':'单据合计';
   return total;
@@ -517,32 +565,47 @@ function updateValidation(){
     '<span class="low-text">低置信度 '+counts.low+'</span>'+
     '<span>待核实行 '+pendingRows+'</span>';
 
-  const total=updateTotal();
-  const multiPagePending=TOTAL_PAGES>1;
-  const totalMismatch=!multiPagePending&&DOCUMENT_TOTAL!==null&&total!==DOCUMENT_TOTAL;
-  const poMissing=!document.getElementById('m_po').value.trim();
-  const status=document.getElementById('validationStatus');
-  status.textContent=poMissing?'PO 号不能为空':pendingRows?'还有 '+pendingRows+' 行关键字段待核实':multiPagePending?'多页单据需合并全部页后确认':totalMismatch?'明细合计与单据合计不一致':'';
-  document.getElementById('confirmBtn').disabled=ROWS.length===0||poMissing||pendingRows>0||multiPagePending||totalMismatch;
+  updateTotal();
+  document.getElementById('exportBtn').disabled=ROWS.length===0;
 }
 
-function confirmReceive(){
-  updateValidation();
-  if(document.getElementById('confirmBtn').disabled)return;
-  const data={
-    po_no: document.getElementById('m_po').value,
-    note: document.getElementById('m_note').value,
-    items: ROWS.map(r=>({
-      sku:r.sku, name:r.name, qty:parseInt(r.qty)||0,
-      exp:r.exp, mfg:r.mfg,
-      batch:r.batch, pallet:r.pallet, box:r.box
-    }))
+async function exportExcel(){
+  if(!ROWS.length)return;
+  const btn=document.getElementById('exportBtn'),status=document.getElementById('exportStatus');
+  btn.disabled=true;status.textContent='';
+  const payload={
+    po_no:document.getElementById('m_po').value,
+    note:document.getElementById('m_note').value,
+    document_total:DOCUMENT_TOTAL,
+    include_batch:ACTIVE_COLS.some(col=>col.k==='batch'),
+    rows:ROWS.map(row=>{
+      const confidence=Number(row.row_confidence);
+      return {
+        sku:String(row.sku??''),name:String(row.name??''),qty:String(row.qty??''),
+        exp:String(row.exp??''),mfg:String(row.mfg??''),batch:String(row.batch??''),
+        pallet:String(row.pallet??''),box:String(row.box??''),
+        row_confidence:row.row_confidence==null||!Number.isFinite(confidence)?null:confidence,
+        reviewed:!hasHardCriticalIssue(row)&&(!needsConfidenceReview(row)||row._reviewed),
+      };
+    }),
   };
-  alert('确认收货！共 '+data.items.length+' 行，合计 '+(data.items.reduce((s,x)=>s+x.qty,0))+' 件。\\n（此处改为 POST 到 TWMS 收货接口）');
-  console.log('收货数据:',data);
+  try{
+    const response=await fetch('/api/export',{
+      method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload),
+    });
+    if(!response.ok)throw new Error('导出失败（'+response.status+'）');
+    const blob=await response.blob();
+    const link=document.createElement('a'),url=URL.createObjectURL(blob);
+    const disposition=response.headers.get('Content-Disposition')||'';
+    const match=disposition.match(/filename="([^"]+)"/);
+    link.href=url;
+    link.download=match?match[1]:'invoice.xlsx';
+    document.body.append(link);link.click();link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),1000);
+  }catch(error){status.textContent=error.message;}
+  finally{btn.disabled=false;}
 }
 
-document.getElementById('m_po').addEventListener('input',updateValidation);
 document.getElementById('m_batches').addEventListener('change',()=>applyBatchCandidates(true));
 </script>
 </body>

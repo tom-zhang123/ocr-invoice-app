@@ -205,6 +205,11 @@ def clean_digits(text):
     return re.sub(r"\D", "", s)
 
 
+def clean_pallet(text):
+    """统一板号分隔符和 OCR 分段空格，不猜测缺失的数字或斜杠。"""
+    return re.sub(r"\s+", "", clean_text(text)).replace("／", "/")
+
+
 def clean_date(text):
     """
     日期轻量清洗：统一分隔符、去空格，保留 OCR 原文，不强行重组避免改错。
@@ -303,6 +308,7 @@ def postprocess(row):
     row["sku"] = clean_sku(row.get("sku", ""))
     row["qty"] = clean_digits(row.get("qty", ""))
     row["box"] = clean_digits(row.get("box", ""))
+    row["pallet"] = clean_pallet(row.get("pallet", ""))
     row["exp"] = clean_date(row.get("exp", ""))
     row["mfg"] = clean_date(row.get("mfg", ""))
     row["batch"] = clean_batch(row.get("batch", ""))

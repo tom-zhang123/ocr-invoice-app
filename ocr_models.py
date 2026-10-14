@@ -17,6 +17,7 @@ from rapidocr import (
 _MODEL_ROOT = os.getenv("RAPIDOCR_MODEL_ROOT_DIR", "/opt/rapidocr-models")
 _GENERAL_ENGINE = None
 _HANDWRITING_ENGINE = None
+_IDENTIFIER_ENGINE = None
 _ENGINE_LOCK = Lock()
 
 
@@ -63,10 +64,31 @@ def get_handwriting_engine():
     return _HANDWRITING_ENGINE or get_general_engine()
 
 
+def get_identifier_engine():
+    """Small English recognizer for uncertain handwritten numeric fields."""
+    global _IDENTIFIER_ENGINE
+    if _IDENTIFIER_ENGINE is None:
+        with _ENGINE_LOCK:
+            if _IDENTIFIER_ENGINE is None:
+                params = _common_params()
+                params.update({
+                    "Global.use_det": False,
+                    "Global.use_cls": False,
+                    "Rec.engine_type": EngineType.ONNXRUNTIME,
+                    "Rec.lang_type": LangRec.EN,
+                    "Rec.model_type": ModelType.MOBILE,
+                    "Rec.ocr_version": OCRVersion.PPOCRV5,
+                    "Rec.rec_batch_num": 16,
+                })
+                _IDENTIFIER_ENGINE = RapidOCR(params=params)
+    return _IDENTIFIER_ENGINE
+
+
 def warmup_models():
     """Resolve model files during image build and initialize them during app startup."""
     get_general_engine()
     get_handwriting_engine()
+    get_identifier_engine()
 
 
 def _recognize_region(image, engine):
@@ -101,6 +123,17 @@ def recognize_lines(images, language="handwriting"):
         return []
     engine = get_handwriting_engine() if language == "handwriting" else get_general_engine()
     result = engine.recognize_txt(images)
+    return [
+        (str(text).strip(), float(score))
+        for text, score in zip(result.txts, result.scores)
+    ]
+
+
+def recognize_identifier_lines(images):
+    """Recognize pre-cropped identifier cells without changing the main OCR batch."""
+    if not images:
+        return []
+    result = get_identifier_engine().recognize_txt(images)
     return [
         (str(text).strip(), float(score))
         for text, score in zip(result.txts, result.scores)
