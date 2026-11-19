@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock
 
 from general_text_ocr import recognize_text
 from text_dates import parse_text_dates
@@ -54,6 +55,42 @@ class TextDateTest(unittest.TestCase):
 
 
 class GeneralTextOcrTest(unittest.TestCase):
+    def test_confident_identifier_skips_detection_without_extracting_embedded_date(self):
+        detector = Mock(side_effect=AssertionError("Detection should not run"))
+        line_reader = Mock(return_value=lines("AS202611190001"))
+        result = recognize_text(image_bytes(), recognizer=detector, text_mode="identifier", line_recognizer=line_reader)
+        self.assertEqual("AS202611190001", result["raw_text"])
+        self.assertEqual([], result["dates"])
+        self.assertEqual(0, result["timing_ms"]["primary_ocr"])
+        line_reader.assert_called_once()
+        detector.assert_not_called()
+
+    def test_low_confidence_empty_or_multiple_lines_fall_back_to_detection(self):
+        low_score = lines("AS123")
+        low_score[0]["confidence"] = 0.5
+        for candidate in [[], low_score, lines("FIRST", "SECOND"), lines("GENERAL TEXT ABC123"), lines("GENERALTEXT")]:
+            with self.subTest(candidate=candidate):
+                detector = Mock(return_value=lines("CORRECT"))
+                result = recognize_text(image_bytes(), recognizer=detector, text_mode="identifier", line_recognizer=lambda _: candidate)
+                self.assertEqual("CORRECT", result["raw_text"])
+                detector.assert_called_once()
+
+    def test_line_engine_error_falls_back_and_paragraph_does_not_use_line_engine(self):
+        for mode in ["identifier", "line", "paragraph"]:
+            with self.subTest(mode=mode):
+                line_reader = Mock(side_effect=RuntimeError("Line inference failed"))
+                detector = Mock(return_value=lines("CORRECT"))
+                result = recognize_text(image_bytes(), recognizer=detector, text_mode=mode, line_recognizer=line_reader)
+                self.assertEqual("CORRECT", result["raw_text"])
+                detector.assert_called_once()
+                self.assertEqual(1 if mode == "identifier" else 0, line_reader.call_count)
+
+    def test_invalid_mode_is_rejected_before_inference(self):
+        detector = Mock()
+        with self.assertRaises(ValueError):
+            recognize_text(image_bytes(), recognizer=detector, text_mode="invalid")
+        detector.assert_not_called()
+
     def test_arbitrary_text_succeeds_without_any_business_field(self):
         result = recognize_text(image_bytes(), recognizer=lambda _: lines("普通文字 ABC-123", "EXP 31/12/2028"))
         self.assertEqual("普通文字 ABC-123\nEXP 31/12/2028", result["raw_text"])
