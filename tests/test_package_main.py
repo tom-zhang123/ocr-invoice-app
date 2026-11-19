@@ -92,7 +92,7 @@ class PackageMainTest(unittest.TestCase):
         with patch.object(self.module, "recognize_text", return_value={"raw_text": "普通文字", "dates": []}) as recognizer:
             upload = self.upload("crop.jpg", JPEG_BYTES, "image/jpeg")
             response = asyncio.run(self.module.text_ocr(file=upload, date_order="auto", x_ocr_token="test-token"))
-        recognizer.assert_called_once_with(JPEG_BYTES, "auto")
+        recognizer.assert_called_once_with(JPEG_BYTES, "auto", text_mode="paragraph")
         self.assertEqual("普通文字", json.loads(response.body)["raw_text"])
         self.assertEqual("no-store", response.headers["cache-control"])
         self.assertTrue(upload.file.closed)
@@ -108,6 +108,17 @@ class PackageMainTest(unittest.TestCase):
                     asyncio.run(self.module.text_ocr(file=self.upload("crop.jpg", content, "image/jpeg"), date_order=order, x_ocr_token=token))
                 self.assertEqual(status, raised.exception.status_code)
                 recognizer.assert_not_called()
+
+    def test_single_line_mode_is_forwarded_and_invalid_mode_is_rejected(self):
+        for mode in ["identifier", "line"]:
+            with patch.object(self.module, "recognize_text", return_value={"raw_text": "AS123", "dates": []}) as recognizer:
+                asyncio.run(self.module.text_ocr(file=self.upload("crop.jpg", JPEG_BYTES, "image/jpeg"), date_order="auto", x_ocr_token="test-token", text_mode=mode))
+                recognizer.assert_called_once_with(JPEG_BYTES, "auto", text_mode=mode)
+        with patch.object(self.module, "recognize_text") as recognizer:
+            with self.assertRaises(HTTPException) as raised:
+                asyncio.run(self.module.text_ocr(file=self.upload("crop.jpg", JPEG_BYTES, "image/jpeg"), date_order="auto", x_ocr_token="test-token", text_mode="invalid"))
+            self.assertEqual(400, raised.exception.status_code)
+            recognizer.assert_not_called()
 
     @staticmethod
     def upload(filename, content, content_type):

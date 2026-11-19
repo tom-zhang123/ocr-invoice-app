@@ -57,3 +57,16 @@ def recognize_package_image(image):
         for box, text, score in zip(result.boxes, result.txts, result.scores)
         if str(text).strip()
     ]
+
+
+def recognize_package_line(image):
+    result = get_package_engine().recognize_txt([image])
+    if result is None or result.txts is None or result.scores is None:
+        return []
+    height, width = image.shape[:2]
+    box = [[0, 0], [width, 0], [width, height], [0, height]]
+    return [
+        {"box": box, "text": str(text).strip(), "confidence": float(score)}
+        for text, score in zip(result.txts, result.scores)
+        if str(text).strip()
+    ]

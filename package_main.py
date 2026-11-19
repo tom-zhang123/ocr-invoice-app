@@ -7,6 +7,7 @@ import logging
 import os
 import secrets
 import uuid
+from typing import Annotated
 
 from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
@@ -82,6 +83,7 @@ async def text_ocr(
     file: UploadFile = File(...),
     date_order: str = Form("auto"),
     x_ocr_token: str = Header("", alias="X-OCR-Token"),
+    text_mode: Annotated[str, Form()] = "paragraph",
 ):
     try:
         _verify_token(x_ocr_token)
@@ -89,11 +91,13 @@ async def text_ocr(
             raise HTTPException(status_code=415, detail="Only JPEG and PNG images are supported")
         if date_order not in {"auto", "dmy", "mdy"}:
             raise HTTPException(status_code=400, detail="Invalid date order")
+        if text_mode not in {"identifier", "line", "paragraph"}:
+            raise HTTPException(status_code=400, detail="Invalid text mode")
         raw = await file.read(MAX_IMAGE_BYTES + 1)
         if len(raw) > MAX_IMAGE_BYTES:
             raise HTTPException(status_code=413, detail="Image exceeds the configured size limit")
         async with _ocr_semaphore:
-            result = await run_in_threadpool(recognize_text, raw, date_order)
+            result = await run_in_threadpool(recognize_text, raw, date_order, text_mode=text_mode)
         result["request_id"] = str(uuid.uuid4())
         return JSONResponse(result, headers={"Cache-Control": "no-store"})
     except HTTPException:
