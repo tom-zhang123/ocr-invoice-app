@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements-package.txt
 COPY package_ocr_models.py .
 RUN python -c "from package_ocr_models import warmup_package_model; warmup_package_model()"
 
-COPY package_main.py package_ocr.py package_text_parser.py ./
+COPY package_main.py package_ocr.py package_text_parser.py general_text_ocr.py text_dates.py ./
 
 EXPOSE 8000
 
