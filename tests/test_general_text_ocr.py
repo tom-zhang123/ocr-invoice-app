@@ -62,17 +62,20 @@ class GeneralTextOcrTest(unittest.TestCase):
         self.assertEqual("AS202611190001", result["raw_text"])
         self.assertEqual([], result["dates"])
         self.assertEqual(0, result["timing_ms"]["primary_ocr"])
+        self.assertEqual({"fast_path_used": True, "fallback_reason": None, "line_confidence": 0.99}, result["line_diagnostics"])
         line_reader.assert_called_once()
         detector.assert_not_called()
 
     def test_low_confidence_empty_or_multiple_lines_fall_back_to_detection(self):
         low_score = lines("AS123")
         low_score[0]["confidence"] = 0.5
-        for candidate in [[], low_score, lines("FIRST", "SECOND"), lines("GENERAL TEXT ABC123"), lines("GENERALTEXT")]:
+        for candidate, reason in [([], "no_text"), (low_score, "low_confidence"), (lines("FIRST", "SECOND"), "multiple_lines"), (lines("GENERAL TEXT ABC123"), "invalid_identifier"), (lines("GENERALTEXT"), "invalid_identifier")]:
             with self.subTest(candidate=candidate):
                 detector = Mock(return_value=lines("CORRECT"))
                 result = recognize_text(image_bytes(), recognizer=detector, text_mode="identifier", line_recognizer=lambda _: candidate)
                 self.assertEqual("CORRECT", result["raw_text"])
+                self.assertFalse(result["line_diagnostics"]["fast_path_used"])
+                self.assertEqual(reason, result["line_diagnostics"]["fallback_reason"])
                 detector.assert_called_once()
 
     def test_line_engine_error_falls_back_and_paragraph_does_not_use_line_engine(self):
@@ -84,6 +87,10 @@ class GeneralTextOcrTest(unittest.TestCase):
                 self.assertEqual("CORRECT", result["raw_text"])
                 detector.assert_called_once()
                 self.assertEqual(1 if mode == "identifier" else 0, line_reader.call_count)
+                if mode == "identifier":
+                    self.assertEqual("line_error", result["line_diagnostics"]["fallback_reason"])
+                else:
+                    self.assertNotIn("line_diagnostics", result)
 
     def test_invalid_mode_is_rejected_before_inference(self):
         detector = Mock()

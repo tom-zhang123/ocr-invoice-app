@@ -78,6 +78,12 @@ TWMS remains the only PDA-facing endpoint. Do not expose this container port pub
 仓储系统响应另含 `proxy_timing_ms`，手持终端日志标签 `TextRecognitionTiming` 记录
 拍照、裁剪、图片字节数、请求及上传写入时间。上传写入时间不等于完整网络传输时间。
 
+单号模式额外返回 `line_diagnostics`，包含 `fast_path_used`、`line_confidence` 和
+`fallback_reason`，不含快速识别原文。回退原因分别为 `low_confidence`（低于 0.95）、
+`invalid_identifier`（不符合单号格式）、`no_text`（无文字）、`multiple_lines`（多行结果）、
+`invalid_confidence`（置信度无效）、`line_error`（行识别异常）。仓储系统会将这些字段写入
+`package-text-ocr` 耗时日志，以便核实为什么单号快速路径回退到完整检测。
+
 真实模型合成样例校验：`python tests/benchmark_single_line.py --font <中文字体路径> --runs 3`。
 该命令只生成测试图片，不读取客户图片；分别验证单号、带空格英文、日期及中文，在四组明暗背景下
 核对文本和日期解析一致性，并输出本机模型耗时。模型耗时不能直接当作线上整次拍照识别耗时。
