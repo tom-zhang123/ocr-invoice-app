@@ -13,6 +13,7 @@ from fastapi.responses import JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 from package_ocr import recognize_package_text
+from general_text_ocr import recognize_text
 from package_ocr_models import warmup_package_model
 from package_text_parser import parse_batch_candidates, parse_required_fields
 
@@ -72,6 +73,36 @@ async def package_text(
     except Exception:
         LOGGER.exception("Package OCR failed request_id=%s", request_id)
         raise HTTPException(status_code=500, detail="Package OCR failed")
+    finally:
+        await file.close()
+
+
+@app.post("/api/text")
+async def text_ocr(
+    file: UploadFile = File(...),
+    date_order: str = Form("auto"),
+    x_ocr_token: str = Header("", alias="X-OCR-Token"),
+):
+    try:
+        _verify_token(x_ocr_token)
+        if file.content_type not in ALLOWED_CONTENT_TYPES:
+            raise HTTPException(status_code=415, detail="Only JPEG and PNG images are supported")
+        if date_order not in {"auto", "dmy", "mdy"}:
+            raise HTTPException(status_code=400, detail="Invalid date order")
+        raw = await file.read(MAX_IMAGE_BYTES + 1)
+        if len(raw) > MAX_IMAGE_BYTES:
+            raise HTTPException(status_code=413, detail="Image exceeds the configured size limit")
+        async with _ocr_semaphore:
+            result = await run_in_threadpool(recognize_text, raw, date_order)
+        result["request_id"] = str(uuid.uuid4())
+        return JSONResponse(result, headers={"Cache-Control": "no-store"})
+    except HTTPException:
+        raise
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except Exception:
+        LOGGER.exception("Text OCR failed")
+        raise HTTPException(status_code=500, detail="Text recognition failed")
     finally:
         await file.close()
 

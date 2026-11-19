@@ -86,6 +86,28 @@ class PackageMainTest(unittest.TestCase):
         paths = {route.path for route in self.module.app.routes}
         self.assertIn("/api/package-text", paths)
         self.assertIn("/health", paths)
+        self.assertIn("/api/text", paths)
+
+    def test_general_text_needs_no_business_fields(self):
+        with patch.object(self.module, "recognize_text", return_value={"raw_text": "普通文字", "dates": []}) as recognizer:
+            upload = self.upload("crop.jpg", JPEG_BYTES, "image/jpeg")
+            response = asyncio.run(self.module.text_ocr(file=upload, date_order="auto", x_ocr_token="test-token"))
+        recognizer.assert_called_once_with(JPEG_BYTES, "auto")
+        self.assertEqual("普通文字", json.loads(response.body)["raw_text"])
+        self.assertEqual("no-store", response.headers["cache-control"])
+        self.assertTrue(upload.file.closed)
+
+    def test_general_text_rejects_auth_size_and_invalid_order_before_inference(self):
+        for token, order, content, status in [
+            ("bad-token", "auto", JPEG_BYTES, 401),
+            ("test-token", "unknown", JPEG_BYTES, 400),
+            ("test-token", "auto", b"x" * (self.module.MAX_IMAGE_BYTES + 1), 413),
+        ]:
+            with self.subTest(status=status), patch.object(self.module, "recognize_text") as recognizer:
+                with self.assertRaises(HTTPException) as raised:
+                    asyncio.run(self.module.text_ocr(file=self.upload("crop.jpg", content, "image/jpeg"), date_order=order, x_ocr_token=token))
+                self.assertEqual(status, raised.exception.status_code)
+                recognizer.assert_not_called()
 
     @staticmethod
     def upload(filename, content, content_type):
