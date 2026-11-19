@@ -18,15 +18,19 @@ def recognize_text(image_bytes, date_order="auto", recognizer=recognize_package_
     image = _resize_if_needed(_decode_image(image_bytes))
     timings = {"decode": _elapsed_ms(started), "line_ocr": 0, "primary_ocr": 0, "enhanced_ocr": 0}
     lines = []
+    line_diagnostics = None
     if text_mode == "identifier":
         stage_started = time.perf_counter()
         try:
             candidate = line_recognizer(image)
-            if confident_single_line(candidate):
+            accepted, reason, confidence = single_line_decision(candidate)
+            line_diagnostics = {"fast_path_used": accepted, "fallback_reason": reason, "line_confidence": confidence}
+            if accepted:
                 lines = candidate
         except Exception:
             # The full pipeline remains the fallback for unsupported or failed line inference.
             lines = []
+            line_diagnostics = {"fast_path_used": False, "fallback_reason": "line_error", "line_confidence": None}
         timings["line_ocr"] = _elapsed_ms(stage_started)
     if not lines:
         stage_started = time.perf_counter()
@@ -45,20 +49,34 @@ def recognize_text(image_bytes, date_order="auto", recognizer=recognize_package_
         **parse_text_dates(raw_text, date_order),
         "timing_ms": {**timings, "total": _elapsed_ms(started)},
         "model": "PP-OCRv6-small",
+        **({"line_diagnostics": line_diagnostics} if line_diagnostics is not None else {}),
     }
 
 
 def confident_single_line(lines):
-    if len(lines) != 1 or not str(lines[0].get("text", "")).strip():
-        return False
+    return single_line_decision(lines)[0]
+
+
+def single_line_decision(lines):
+    if not lines:
+        return False, "no_text", None
+    if len(lines) != 1:
+        return False, "multiple_lines", None
+    text = str(lines[0].get("text", "")).strip()
+    if not text:
+        return False, "no_text", None
     try:
-        text = str(lines[0]["text"]).strip()
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:-]{1,127}", text) or not any(c.isdigit() for c in text):
-            return False
         score = float(lines[0].get("confidence", 0))
-        return math.isfinite(score) and score >= 0.95
+        score = score if math.isfinite(score) else None
     except (TypeError, ValueError):
-        return False
+        score = None
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_./:-]{1,127}", text) or not any(c.isdigit() for c in text):
+        return False, "invalid_identifier", score
+    if score is None:
+        return False, "invalid_confidence", None
+    if score < 0.95:
+        return False, "low_confidence", score
+    return True, None, score
 
 
 def reading_lines(lines):
