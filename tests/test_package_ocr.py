@@ -26,6 +26,17 @@ def lines(*texts):
 
 
 class PackageOcrTest(unittest.TestCase):
+    def test_short_expiry_is_complete_without_enhancement_retry(self):
+        calls = []
+        def recognizer(_):
+            calls.append(True)
+            return lines("12 09 28", "637G1CHB04 03:30")
+        result = recognize_package_text(image_bytes(), [EXPIRE_AT, BATCH], recognizer=recognizer)
+        self.assertEqual("2028-09-12", result[EXPIRE_AT])
+        self.assertEqual("637G1CHB04 03:30", result[BATCH])
+        self.assertEqual([], result["missing_required_fields"])
+        self.assertEqual(1, len(calls))
+
     def test_complete_primary_result_does_not_run_enhanced_retry(self):
         calls = []
 

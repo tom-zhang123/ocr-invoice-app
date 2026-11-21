@@ -13,6 +13,22 @@ from package_text_parser import (
 
 
 class PackageTextParserTest(unittest.TestCase):
+    def test_short_packaging_expiry_preserves_batch_and_time(self):
+        for value in ["12 09 28", "12.09.28", "12/09/28", "12-09-28", "12 09.28", "120928", "12.0928", "1209.28"]:
+            with self.subTest(value=value):
+                result = parse_package_text(value + "\n637G1CHB04 03:30", [EXPIRE_AT, BATCH])
+                self.assertEqual("2028-09-12", result[EXPIRE_AT])
+                self.assertEqual("637G1CHB04 03:30", result[BATCH])
+
+    def test_short_dates_keep_roles_and_calendar_validation(self):
+        result = parse_package_text("MFG 12 09 26\nEXP 12 09 28\nABC123", [MANUFACTURE_AT, EXPIRE_AT, BATCH])
+        self.assertEqual("2026-09-12", result[MANUFACTURE_AT])
+        self.assertEqual("2028-09-12", result[EXPIRE_AT])
+        for text in ["31 02 28", "29 02 27", "03:30:28", "18853301013892", "LOT 12 09 28", "DLD no. 01 07 68 0846"]:
+            with self.subTest(text=text):
+                self.assertIsNone(parse_package_text(text, [EXPIRE_AT])[EXPIRE_AT])
+        self.assertEqual("2028-02-29", parse_package_text("29 02 28", [EXPIRE_AT])[EXPIRE_AT])
+
     def test_six_sample_text_shapes(self):
         cases = [
             (

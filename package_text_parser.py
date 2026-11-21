@@ -3,6 +3,7 @@
 from datetime import date
 import json
 import re
+from text_dates import short_date_readings
 
 
 MANUFACTURE_AT = "manufacture_at"
@@ -131,6 +132,13 @@ def parse_package_text(raw_text, required_fields):
                         "line_index": line_index,
                         "label": _date_label(line, match.span()),
                     })
+        for match, value in short_date_readings(line):
+            date_candidates.append({
+                "value": value,
+                "ordinal": int(value.replace("-", "")),
+                "line_index": line_index,
+                "label": _date_label(line, match.span()),
+            })
 
     manufacture = _distinct_candidates(date_candidates, "manufacture")
     expire = _distinct_candidates(date_candidates, "expire")
@@ -322,11 +330,13 @@ def _is_structured_numeric_batch(value):
 
 
 def _remove_dates(value):
+    for match, _ in reversed(list(short_date_readings(value))):
+        value = value[:match.start()] + " " + value[match.end():]
     return COMPACT_DATE_PATTERN.sub(" ", DATE_PATTERN.sub(" ", value))
 
 
 def _contains_date(value):
-    return bool(DATE_PATTERN.search(value) or COMPACT_DATE_PATTERN.search(value))
+    return bool(DATE_PATTERN.search(value) or COMPACT_DATE_PATTERN.search(value) or next(short_date_readings(value), None))
 
 
 def _parse_date_match(match):

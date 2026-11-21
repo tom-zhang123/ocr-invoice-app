@@ -5,6 +5,9 @@ from datetime import date
 _MONTHS = {name: index for index, name in enumerate(
     ("JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"), 1
 )}
+_SHORT_BODY = (r"(?:\d{1,2}(?:\s*[./-]\s*|\s+)\d{1,2}(?:\s*[./-]\s*|\s+)\d{2}"
+               r"|\d{2}\s*[./-]\s*\d{4}|\d{4}\s*[./-]\s*\d{2})")
+SHORT_DATE_PATTERN = re.compile(r"(?<![A-Za-z0-9_./:-])(" + _SHORT_BODY + r"|\d{6})(?![A-Za-z0-9_]|[./:-]\d)")
 _PATTERN = re.compile(
     r"(?<![A-Za-z0-9_])(?:"
     r"(?P<y>20\d{2}|19\d{2}|21\d{2})\s*(?:[-/.年]|\s)\s*(?P<m>\d{1,2})\s*(?:[-/.月]|\s)\s*(?P<d>\d{1,2})日?"
@@ -12,6 +15,8 @@ _PATTERN = re.compile(
     r"|(?P<day>\d{1,2})[\s./-]*(?P<month>JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)[\s,./-]*(?P<english_year>19\d{2}|20\d{2}|21\d{2})"
     r"|(?P<first_month>JAN(?:UARY)?|FEB(?:RUARY)?|MAR(?:CH)?|APR(?:IL)?|MAY|JUN(?:E)?|JUL(?:Y)?|AUG(?:UST)?|SEP(?:TEMBER)?|OCT(?:OBER)?|NOV(?:EMBER)?|DEC(?:EMBER)?)[\s./-]+(?P<first_day>\d{1,2})[\s,./-]+(?P<first_year>19\d{2}|20\d{2}|21\d{2})"
     r"|(?P<compact>(?:19|20|21)\d{6}|\d{4}(?:19|20|21)\d{2})"
+    r"|(?P<short>" + _SHORT_BODY + r")"
+    r"|(?P<short_compact>\d{6})"
     r")(?![A-Za-z0-9_])", re.IGNORECASE,
 )
 _LABELS = {
@@ -46,8 +51,16 @@ def parse_text_dates(text, date_order="auto"):
             if label == "identifier":
                 continue
             parts = match.groupdict()
+            short_value = parts["short"] or parts["short_compact"]
+            if short_value and not _isolated_short_date(line, match.start(), match.end()):
+                continue
             candidates = []
-            if parts["y"]:
+            if short_value:
+                candidates = short_date_values(short_value, date_order)
+                if not candidates and len(re.findall(r"\d+", short_value)) < 3:
+                    continue
+                triples = []
+            elif parts["y"]:
                 triples = [(int(parts["y"]), int(parts["m"]), int(parts["d"]))]
             elif parts["compact"]:
                 value = parts["compact"]
@@ -89,6 +102,46 @@ def parse_text_dates(text, date_order="auto"):
             line = line[:start] + value + line[end:]
         normalized_lines.append(line)
     return {"dates": dates, "normalized_text": "\n".join(normalized_lines)}
+
+
+def short_date_values(raw, date_order="dmy"):
+    """Packaging short years mean 2000–2099; auto follows the existing DMY convention."""
+    groups = [raw[:2], raw[2:4], raw[4:]] if re.fullmatch(r"\d{6}", raw) else re.findall(r"\d+", raw)
+    if len(groups) == 2:
+        digits = "".join(groups)
+        groups = [digits[:2], digits[2:4], digits[4:]]
+    first, second, year = map(int, groups)
+    month, day = (first, second) if date_order == "mdy" else (second, first)
+    try:
+        return [date(2000 + year, month, day).isoformat()]
+    except ValueError:
+        return []
+
+
+def short_date_readings(line):
+    """Expose the same short-date rules to the legacy package parser."""
+    for match in SHORT_DATE_PATTERN.finditer(line):
+        if not _isolated_short_date(line, match.start(), match.end()):
+            continue
+        if _label_for(line[:match.start()]) == "identifier":
+            continue
+        values = short_date_values(match.group())
+        if values:
+            yield match, values[0]
+
+
+def _isolated_short_date(line, start, end):
+    # Do not extract three groups from a barcode, time, registration or numeric batch run.
+    if start and re.search(r"[A-Za-z0-9_./:-]$", line[:start]):
+        return False
+    if re.search(r"\d\s+$", line[:start]):
+        return False
+    following = line[end:]
+    if re.match(r"\s+\d", following) and not re.match(r"\s+\d{1,2}:\d{2}(?:\D|$)", following):
+        return False
+    if re.search(r"\b(?:DLD|REG)\b[^\n]*$", line[:start], re.I):
+        return False
+    return True
 
 
 def _label_for(context):

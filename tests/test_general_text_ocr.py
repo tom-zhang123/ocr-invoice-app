@@ -7,6 +7,30 @@ from tests.test_package_ocr import image_bytes, lines
 
 
 class TextDateTest(unittest.TestCase):
+    def test_short_packaging_dates_use_day_month_and_2000_century(self):
+        for text in ["12 09 28", "12.09.28", "12/09/28", "12-09-28", "12 09.28", "120928", "12.0928", "1209.28"]:
+            with self.subTest(text=text):
+                result = parse_text_dates(text)
+                self.assertEqual("2028-09-12", result["normalized_text"])
+                self.assertEqual("2028-09-12", result["dates"][0]["value"])
+        self.assertEqual("2028-12-09", parse_text_dates("12 09 28", "mdy")["dates"][0]["value"])
+
+    def test_short_dates_do_not_consume_batch_time_or_long_numeric_runs(self):
+        result = parse_text_dates("12 09 28\n637G1CHB04 03:30\n18853301013892")
+        self.assertEqual(1, len(result["dates"]))
+        self.assertEqual("2028-09-12\n637G1CHB04 03:30\n18853301013892", result["normalized_text"])
+        for text in ["03:30:28", "LOT 12 09 28", "SKU 120928", "1 12 09 28 3", "DLD no. 01 07 68 0846", "637G1CHB04 03:30", "AS120928", "4060712"]:
+            with self.subTest(text=text):
+                self.assertEqual([], parse_text_dates(text)["dates"])
+
+    def test_short_date_invalid_calendar_is_not_normalized(self):
+        self.assertEqual("2028-02-29", parse_text_dates("29 02 28")["dates"][0]["value"])
+        for text in ["31 02 28", "29 02 27"]:
+            with self.subTest(text=text):
+                result = parse_text_dates(text)
+                self.assertEqual("invalid", result["dates"][0]["status"])
+                self.assertEqual(text, result["normalized_text"])
+
     def test_explicit_dates_and_roles_preserve_original_text(self):
         text = "生产日期2026年11月19日\nEXP 31/12/2028\n19 NOV 2026"
         result = parse_text_dates(text)
@@ -55,6 +79,14 @@ class TextDateTest(unittest.TestCase):
 
 
 class GeneralTextOcrTest(unittest.TestCase):
+    def test_new_line_and_paragraph_modes_parse_short_expiry(self):
+        for mode in ["line", "paragraph"]:
+            for text in ["12 09 28", "120928"]:
+                with self.subTest(mode=mode, text=text):
+                    result = recognize_text(image_bytes(), text_mode=mode, recognizer=lambda _: lines(text))
+                    self.assertEqual(text, result["raw_text"])
+                    self.assertEqual("2028-09-12", result["normalized_text"])
+
     def test_confident_identifier_skips_detection_without_extracting_embedded_date(self):
         detector = Mock(side_effect=AssertionError("Detection should not run"))
         line_reader = Mock(return_value=lines("AS202611190001"))
